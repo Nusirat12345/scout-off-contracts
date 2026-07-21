@@ -12,6 +12,15 @@ pub struct PlayerVitals {
     pub nationality: String,
 }
 
+/// Admin-configurable registration rate-limit policy.
+/// When absent or disabled, registrations are not throttled.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RateLimitConfig {
+    pub window_secs: u64,
+    pub max_registrations: u32,
+}
+
 /// Internal on-chain player profile (no level — progress contract is the source of truth)
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -110,4 +119,12 @@ pub enum DataKey {
     /// hidden from `filter_players` results while their profile and history are
     /// fully preserved. Set by `deactivate_player`, cleared by `reactivate_player`.
     PlayerDeactivated(u64),
+    /// Admin-configurable rate-limit window configuration.
+    /// Stored in instance storage; absent means rate-limiting is disabled.
+    RateLimitConfig,
+    /// Per-wallet registration timestamp window.
+    /// Tracks the last N registration timestamps for `wallet` so the contract
+    /// can reject registrations that exceed `max_registrations_per_window`.
+    /// Key: wallet address → Vec<u64> of ledger timestamps.
+    RegistrationWindow(Address),
 }

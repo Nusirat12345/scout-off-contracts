@@ -1,12 +1,12 @@
 #![cfg_attr(target_family = "wasm", no_std)]
 mod errors;
 mod events;
-mod types;
+pub mod types;
 
 use errors::ScoutChainError;
 use types::{
     ContractHealth, DataKey, FilterResult, PlayerProfile, PlayerSummary, PlayerVitals,
-    ProgressLevel, ScoutProfile, StoredPlayerProfile,
+    ProgressLevel, RateLimitConfig, ScoutProfile, StoredPlayerProfile,
 };
 
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
@@ -118,6 +118,28 @@ impl RegistrationContract {
         Ok(())
     }
 
+    /// Configure the per-wallet registration throttle. A missing or zero-valued
+    /// config disables the limit. Admin-only.
+    pub fn set_rate_limit_config(
+        env: Env,
+        window_secs: u64,
+        max_registrations: u32,
+    ) -> Result<(), ScoutChainError> {
+        Self::require_admin(&env)?;
+        if window_secs == 0 || max_registrations == 0 {
+            env.storage().instance().remove(&DataKey::RateLimitConfig);
+            return Ok(());
+        }
+        env.storage().instance().set(
+            &DataKey::RateLimitConfig,
+            &RateLimitConfig {
+                window_secs,
+                max_registrations,
+            },
+        );
+        Ok(())
+    }
+
     /// Update a player's progress level. Only callable by the registered progress contract.
     pub fn set_player_level(
         env: Env,
@@ -178,6 +200,8 @@ impl RegistrationContract {
         Self::require_initialized(&env)?;
         Self::require_not_paused(&env)?;
         wallet.require_auth();
+
+        Self::enforce_registration_rate_limit(&env, &wallet)?;
 
         // Prevent duplicate registrations
         if env
@@ -354,6 +378,8 @@ impl RegistrationContract {
         if region.len() > MAX_REGION_LEN {
             return Err(ScoutChainError::InvalidInput);
         }
+
+        Self::enforce_registration_rate_limit(&env, &wallet)?;
 
         if env
             .storage()
@@ -683,6 +709,49 @@ impl RegistrationContract {
         Ok(())
     }
 
+    fn enforce_registration_rate_limit(env: &Env, wallet: &Address) -> Result<(), ScoutChainError> {
+        let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateLimitConfig>(&DataKey::RateLimitConfig)
+        else {
+            return Ok(());
+        };
+
+        if config.window_secs == 0 || config.max_registrations == 0 {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        let key = DataKey::RegistrationWindow(wallet.clone());
+        let stored: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let cutoff = now.saturating_sub(config.window_secs);
+        let mut window = Vec::new(env);
+        for ts in stored.iter() {
+            if ts >= cutoff {
+                window.push_back(ts);
+            }
+        }
+
+        if window.len() >= config.max_registrations {
+            return Err(ScoutChainError::RateLimited);
+        }
+
+        window.push_back(now);
+        env.storage().persistent().set(&key, &window);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+        Ok(())
+    }
+
     fn load_stored_player(
         env: &Env,
         player_id: u64,
@@ -902,6 +971,42 @@ mod tests {
         let profile = client.get_player(&player_id);
         assert_eq!(profile.wallet, wallet);
         assert_eq!(profile.level, ProgressLevel::Unverified);
+    }
+
+    #[test]
+    fn test_rate_limit_blocks_rapid_player_registrations() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        client.set_rate_limit_config(&60u64, &1u32);
+
+        let wallet = Address::generate(&env);
+        let vitals = dummy_vitals(&env);
+        let hashes: soroban_sdk::Vec<String> = vec![&env, String::from_str(&env, "QmTest123")];
+
+        let player_id = client.register_player(&wallet, &vitals, &hashes);
+        assert_eq!(player_id, 1);
+
+        let result = client.try_register_player(&wallet, &vitals, &hashes);
+        assert_eq!(result, Err(Ok(ScoutChainError::RateLimited)));
+    }
+
+    #[test]
+    fn test_rate_limit_blocks_rapid_scout_registrations() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        client.set_rate_limit_config(&60u64, &1u32);
+
+        let wallet = Address::generate(&env);
+        let first_region = String::from_str(&env, "West Africa");
+        let second_region = String::from_str(&env, "East Africa");
+
+        let scout_id = client.register_scout(&wallet, &first_region);
+        assert_eq!(scout_id, 1);
+
+        let result = client.try_register_scout(&wallet, &second_region);
+        assert_eq!(result, Err(Ok(ScoutChainError::RateLimited)));
     }
 
     #[test]

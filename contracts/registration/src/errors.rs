@@ -40,4 +40,6 @@ pub enum ScoutChainError {
     InvalidInput = 13,
     /// Counter or fee arithmetic overflowed.
     Overflow = 11,
+    /// Too many registrations from the same wallet within the configured window.
+    RateLimited = 14,
 }
